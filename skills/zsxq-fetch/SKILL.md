@@ -1,6 +1,7 @@
 ---
 name: zsxq-fetch
 description: Use this skill when the user wants OpenClaw to query synced Zhishi Xingqiu content, inspect recent posts, search downloaded documents, summarize updates, or answer questions grounded in the local ZSXQ database.
+metadata: {"openclaw":{"requires":{"bins":["curl"]}}}
 ---
 
 # ZSXQ Fetch
