@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from html import unescape
 import json
+import logging
 from pathlib import Path
 import re
 from typing import Any
@@ -18,6 +19,8 @@ except ImportError:
     except ImportError:
         PdfReader = None
 
+logger = logging.getLogger(__name__)
+
 
 class DocumentIngestor:
     def __init__(self, storage_path: str, headers: dict[str, str]) -> None:
@@ -28,9 +31,15 @@ class DocumentIngestor:
     def ingest_topic_documents(self, group_id: str, topic: dict[str, Any]) -> list[dict[str, Any]]:
         documents: list[dict[str, Any]] = []
         for file_item in topic.get("files") or []:
-            document = self._download_and_extract(group_id=group_id, topic=topic, file_item=file_item)
-            if document is not None:
-                documents.append(document)
+            try:
+                document = self._download_and_extract(group_id=group_id, topic=topic, file_item=file_item)
+                if document is not None:
+                    documents.append(document)
+            except Exception:
+                logger.exception(
+                    "Failed to ingest document %s for topic %s in group %s",
+                    file_item.get("file_id"), topic.get("topic_id"), group_id,
+                )
         return documents
 
     def _download_and_extract(
@@ -43,6 +52,7 @@ class DocumentIngestor:
         if not download_url:
             return None
 
+        logger.info("Downloading document %s from group %s", file_item.get("name"), group_id)
         response = requests.get(
             download_url,
             headers=self.headers,
@@ -59,6 +69,7 @@ class DocumentIngestor:
         target_path.write_bytes(content)
 
         extracted_text, extraction_status = self._extract_text(target_path, content)
+        logger.info("Extracted document %s: status=%s", original_name, extraction_status)
         return {
             "document_id": f"{group_id}:{topic_id}:{file_id}",
             "group_id": group_id,
@@ -116,6 +127,7 @@ class DocumentIngestor:
                 with docx.open("word/document.xml") as document_xml:
                     tree = ElementTree.parse(document_xml)
         except Exception:
+            logger.warning("Failed to parse DOCX: %s", path)
             return None
 
         namespaces = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
@@ -133,6 +145,7 @@ class DocumentIngestor:
         try:
             reader = PdfReader(str(path))
         except Exception:
+            logger.warning("Failed to parse PDF: %s", path)
             return None
 
         pages: list[str] = []

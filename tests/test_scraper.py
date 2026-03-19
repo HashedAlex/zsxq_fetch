@@ -11,7 +11,7 @@ from app.services.zsxq_scraper import ZsxqScraper
 
 class ZsxqScraperTests(unittest.TestCase):
     def test_clean_topics_response_strips_html_and_normalizes_fields(self) -> None:
-        scraper = ZsxqScraper("token", "group")
+        scraper = ZsxqScraper("token", "group", request_delay=0)
         payload = {
             "resp_data": {
                 "topics": [
@@ -52,7 +52,7 @@ class ZsxqScraperTests(unittest.TestCase):
         self.assertEqual(cleaned["topics"][0]["images"][0]["large"], "L")
 
     def test_fetch_all_posts_paginates_until_has_more_is_false(self) -> None:
-        scraper = ZsxqScraper("token", "group")
+        scraper = ZsxqScraper("token", "group", request_delay=0)
         pages = [
             {
                 "group_id": "group",
@@ -79,7 +79,7 @@ class ZsxqScraperTests(unittest.TestCase):
         self.assertEqual(mock_fetch_posts.call_count, 2)
 
     def test_fetch_all_posts_deduplicates_topics_across_pages(self) -> None:
-        scraper = ZsxqScraper("token", "group")
+        scraper = ZsxqScraper("token", "group", request_delay=0)
         pages = [
             {
                 "group_id": "group",
@@ -104,7 +104,7 @@ class ZsxqScraperTests(unittest.TestCase):
         self.assertEqual(result["count"], 3)
 
     def test_clean_groups_response_normalizes_fields(self) -> None:
-        scraper = ZsxqScraper("token")
+        scraper = ZsxqScraper("token", request_delay=0)
         payload = {
             "resp_data": {
                 "groups": [
@@ -130,7 +130,7 @@ class ZsxqScraperTests(unittest.TestCase):
         self.assertEqual(cleaned["groups"][0]["statistics"]["members_count"], 120)
 
     def test_filter_promotional_topics_removes_event_ads(self) -> None:
-        scraper = ZsxqScraper("token", "group")
+        scraper = ZsxqScraper("token", "group", request_delay=0)
         kept_topics, filtered_topics = scraper.filter_promotional_topics(
             [
                 {
@@ -158,7 +158,7 @@ class ZsxqScraperTests(unittest.TestCase):
         self.assertEqual([item["topic_id"] for item in filtered_topics], [2])
 
     def test_fetch_all_groups_paginates_until_has_more_is_false(self) -> None:
-        scraper = ZsxqScraper("token")
+        scraper = ZsxqScraper("token", request_delay=0)
         pages = [
             {
                 "count": 1,
@@ -183,7 +183,7 @@ class ZsxqScraperTests(unittest.TestCase):
         self.assertEqual(mock_list_groups.call_count, 2)
 
     def test_list_groups_falls_back_to_legacy_endpoint(self) -> None:
-        scraper = ZsxqScraper("token")
+        scraper = ZsxqScraper("token", request_delay=0)
 
         class FakeResponse:
             def __init__(self, payload: dict, status_code: int) -> None:
@@ -236,7 +236,7 @@ class ZsxqScraperTests(unittest.TestCase):
                 latest_create_time="2024-01-01T09:00:00.000+0800",
                 latest_create_time_iso="2024-01-01T01:00:00+00:00",
             )
-            scraper = ZsxqScraper("token", "group-1")
+            scraper = ZsxqScraper("token", "group-1", request_delay=0)
             pages = [
                 {
                     "group_id": "group-1",
@@ -275,7 +275,7 @@ class ZsxqScraperTests(unittest.TestCase):
     def test_sync_group_posts_filters_promotional_topics_but_updates_marker(self) -> None:
         with TemporaryDirectory() as temp_dir:
             store = SQLiteStore(f"{temp_dir}/openclaw.db")
-            scraper = ZsxqScraper("token", "group-1")
+            scraper = ZsxqScraper("token", "group-1", request_delay=0)
             pages = [
                 {
                     "group_id": "group-1",
@@ -417,7 +417,7 @@ class ZsxqScraperTests(unittest.TestCase):
     def test_sync_all_groups_posts_aggregates_results(self) -> None:
         with TemporaryDirectory() as temp_dir:
             store = SQLiteStore(f"{temp_dir}/openclaw.db")
-            scraper = ZsxqScraper("token")
+            scraper = ZsxqScraper("token", request_delay=0)
 
             with patch.object(
                 scraper,
@@ -468,6 +468,65 @@ class ZsxqScraperTests(unittest.TestCase):
         self.assertEqual(result["filtered_topics_count"], 1)
         self.assertEqual(result["saved_count"], 3)
         self.assertEqual(result["documents_saved_count"], 3)
+
+    def test_batch_topic_ids_exist(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = SQLiteStore(f"{temp_dir}/openclaw.db")
+            store.upsert_topics(
+                [
+                    {
+                        "topic_id": 1,
+                        "type": "talk",
+                        "create_time": "2024-01-01T10:00:00.000+0800",
+                        "create_time_iso": "2024-01-01T02:00:00+00:00",
+                        "text": "existing",
+                        "answer_text": "",
+                        "owner": {"name": "alice"},
+                        "like_count": 0,
+                        "comment_count": 0,
+                        "liked": False,
+                    }
+                ],
+                group_id="group-1",
+            )
+
+            existing = store.topic_ids_exist(["1", "2", "3"], "group-1")
+
+        self.assertEqual(existing, {"1"})
+
+    def test_filtered_topics_saved_to_filtered_table(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = SQLiteStore(f"{temp_dir}/openclaw.db")
+            scraper = ZsxqScraper("token", "group-1", request_delay=0)
+            pages = [
+                {
+                    "group_id": "group-1",
+                    "count": 1,
+                    "has_more": False,
+                    "next_end_time": "2024-01-01T08:00:00.000+0800",
+                    "topics": [
+                        {
+                            "topic_id": 5,
+                            "create_time": "2024-01-01T11:00:00.000+0800",
+                            "create_time_iso": "2024-01-01T03:00:00+00:00",
+                            "text": "活动预告：直播预约开启，扫码报名，限时优惠 https://example.com",
+                            "images": [{"image_id": 1}, {"image_id": 2}],
+                            "files": [],
+                        },
+                    ],
+                }
+            ]
+
+            with patch.object(scraper, "fetch_posts", side_effect=pages):
+                scraper.sync_group_posts(store=store, page_size=20, max_pages=5)
+
+            conn = store._connect()
+            row = conn.execute(
+                "SELECT topic_id FROM filtered_topics WHERE group_id = ?", ("group-1",)
+            ).fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row["topic_id"], "5")
 
 
 class SQLiteStoreTests(unittest.TestCase):
@@ -540,6 +599,28 @@ class SQLiteStoreTests(unittest.TestCase):
 
         self.assertEqual(len(documents), 1)
         self.assertIn("AlphaTerm", documents[0]["match_preview"])
+
+    def test_get_all_sync_states(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = SQLiteStore(f"{temp_dir}/openclaw.db")
+            store.update_group_sync_state(
+                group_id="group-1",
+                latest_topic_id=1,
+                latest_create_time="2024-01-01T10:00:00.000+0800",
+                latest_create_time_iso="2024-01-01T02:00:00+00:00",
+            )
+            store.update_group_sync_state(
+                group_id="group-2",
+                latest_topic_id=2,
+                latest_create_time="2024-01-02T10:00:00.000+0800",
+                latest_create_time_iso="2024-01-02T02:00:00+00:00",
+            )
+
+            states = store.get_all_sync_states()
+
+        self.assertEqual(len(states), 2)
+        group_ids = {s["group_id"] for s in states}
+        self.assertEqual(group_ids, {"group-1", "group-2"})
 
 
 if __name__ == "__main__":

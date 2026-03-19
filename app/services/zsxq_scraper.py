@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from html import unescape
+import logging
 import re
+import time
 from typing import Any
 
 import requests
 
 from app.services.document_ingestor import DocumentIngestor
 from app.services.sqlite_store import SQLiteStore
+
+logger = logging.getLogger(__name__)
 
 
 class ZsxqScraper:
@@ -21,41 +26,45 @@ class ZsxqScraper:
         r"报名链接",
         r"购买链接",
         r"课程优惠",
-        r"直播预约",
         r"海报",
         r"推广",
         r"赞助",
     )
     PROMO_PATTERNS = (
-        r"活动",
-        r"预告",
         r"报名",
         r"优惠",
         r"折扣",
         r"福利",
         r"名额",
         r"训练营",
-        r"直播",
-        r"公开课",
-        r"分享会",
-        r"嘉宾",
         r"购票",
         r"早鸟",
         r"私聊",
         r"咨询",
         r"二维码",
-        r"转发",
     )
     URL_PATTERNS = (
         r"https?://",
         r"www\.",
     )
 
-    def __init__(self, access_token: str, group_id: str | None = None) -> None:
+    def __init__(
+        self,
+        access_token: str,
+        group_id: str | None = None,
+        request_delay: float = 0.5,
+    ) -> None:
         self.access_token = access_token
         self.group_id = group_id
         self.base_url = "https://api.zsxq.com/v2"
         self.legacy_base_url = "https://api.zsxq.com/v1"
+        self.request_delay = request_delay
+
+    def _throttled_get(self, url: str, **kwargs: Any) -> requests.Response:
+        response = requests.get(url, **kwargs)
+        if self.request_delay > 0:
+            time.sleep(self.request_delay)
+        return response
 
     def fetch_posts(
         self,
@@ -72,7 +81,8 @@ class ZsxqScraper:
         if end_time:
             params["end_time"] = end_time
 
-        response = requests.get(
+        logger.info("Fetching posts for group %s (count=%s, end_time=%s)", self.group_id, params["count"], end_time)
+        response = self._throttled_get(
             f"{self.base_url}/groups/{self.group_id}/topics",
             headers=self._build_headers(),
             params=params,
@@ -97,7 +107,7 @@ class ZsxqScraper:
         response: requests.Response | None = None
         last_error: requests.HTTPError | None = None
         for url in (f"{self.base_url}/groups", f"{self.legacy_base_url}/groups"):
-            response = requests.get(
+            response = self._throttled_get(
                 url,
                 headers=self._build_headers(),
                 params=params,
@@ -108,6 +118,7 @@ class ZsxqScraper:
                 payload = response.json()
                 return self.clean_groups_response(payload, requested_count=params["count"])
             except requests.HTTPError as exc:
+                logger.warning("Groups endpoint %s failed: %s", url, exc)
                 last_error = exc
                 continue
 
@@ -243,10 +254,14 @@ class ZsxqScraper:
             fetched_pages += 1
             topics = page.get("topics") or []
 
+            # Batch check which topic_ids already exist
+            page_topic_ids = [str(t["topic_id"]) for t in topics if t.get("topic_id") is not None]
+            known_ids = store.topic_ids_exist(page_topic_ids, self.group_id)
+
             for topic in topics:
                 if latest_seen_topic is None:
                     latest_seen_topic = topic
-                if self._is_known_topic(topic, latest_marker, store):
+                if self._is_known_topic(topic, latest_marker, known_ids):
                     hit_known_topic = True
                     break
                 if self._is_promotional_topic(topic):
@@ -266,6 +281,8 @@ class ZsxqScraper:
             previous_end_time = next_end_time
 
         saved_count = store.upsert_topics(all_new_topics, self.group_id) if all_new_topics else 0
+        if filtered_topics:
+            store.upsert_filtered_topics(filtered_topics, self.group_id)
         if docs_storage_path and all_new_topics:
             ingestor = DocumentIngestor(docs_storage_path, self._build_headers())
             documents: list[dict[str, Any]] = []
@@ -290,6 +307,10 @@ class ZsxqScraper:
                 latest_create_time_iso=latest_marker.get("latest_create_time_iso"),
             )
 
+        logger.info(
+            "Sync group %s: %d new, %d filtered, %d saved, %d docs",
+            self.group_id, len(all_new_topics), len(filtered_topics), saved_count, documents_saved,
+        )
         return {
             "group_id": self.group_id,
             "new_topics_count": len(all_new_topics),
@@ -320,15 +341,14 @@ class ZsxqScraper:
         topic_page_size: int = 20,
         topic_max_pages: int = 10,
         scope: str = "all",
+        max_workers: int = 3,
     ) -> dict[str, Any]:
         groups_payload = self.fetch_all_groups(page_size=group_page_size, max_pages=max_group_pages)
-        results: list[dict[str, Any]] = []
+        groups = [g for g in (groups_payload.get("groups") or []) if g.get("group_id") is not None]
 
-        for group in groups_payload.get("groups") or []:
-            group_id = group.get("group_id")
-            if group_id is None:
-                continue
-            group_scraper = ZsxqScraper(self.access_token, str(group_id))
+        def _sync_one(group: dict[str, Any]) -> dict[str, Any]:
+            group_id = str(group["group_id"])
+            group_scraper = ZsxqScraper(self.access_token, group_id, request_delay=self.request_delay)
             sync_result = group_scraper.sync_group_posts(
                 store=store,
                 docs_storage_path=docs_storage_path,
@@ -337,7 +357,17 @@ class ZsxqScraper:
                 max_pages=topic_max_pages,
             )
             sync_result["group"] = group
-            results.append(sync_result)
+            return sync_result
+
+        results: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_sync_one, g): g for g in groups}
+            for future in as_completed(futures):
+                group = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception:
+                    logger.exception("Failed to sync group %s", group.get("group_id"))
 
         return {
             "groups_count": len(results),
@@ -520,10 +550,10 @@ class ZsxqScraper:
         self,
         topic: dict[str, Any],
         latest_marker: dict[str, Any] | None,
-        store: SQLiteStore,
+        known_ids: set[str],
     ) -> bool:
         topic_id = topic.get("topic_id")
-        if topic_id is not None and store.topic_exists(topic_id, self.group_id or ""):
+        if topic_id is not None and str(topic_id) in known_ids:
             return True
 
         if latest_marker is None:
@@ -561,11 +591,11 @@ class ZsxqScraper:
         has_marketing_images = len(topic.get("images") or []) >= 2
         has_files = bool(topic.get("files"))
 
-        if strong_hits >= 1 and (promo_hits >= 2 or url_hits >= 1 or has_marketing_images or has_files):
+        if strong_hits >= 2 and (promo_hits >= 2 or url_hits >= 1 or has_marketing_images or has_files):
             return True
         if promo_hits >= 4 and (url_hits >= 1 or has_marketing_images):
             return True
-        if promo_hits >= 5:
+        if promo_hits >= 6:
             return True
         return False
 
